@@ -9,7 +9,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.LocationOn
@@ -30,23 +29,25 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.pawamaan20.R
 import com.example.pawamaan20.ml.AqiPredictionModel
+import com.example.pawamaan20.ml.AqiPredictionResult
 import com.example.pawamaan20.viewmodel.DeviceViewModel
 import com.example.pawamaan20.viewmodel.DeviceData
-import com.example.pawamaan20.viewmodel.DeviceItem
-import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.Locale
+import java.text.SimpleDateFormat
+import java.util.*
 
 @Composable
 fun HomeScreen(
-    deviceViewModel: DeviceViewModel, 
+    deviceViewModel: DeviceViewModel,
     onLogout: () -> Unit,
     onNavigateToAddDevice: () -> Unit,
     onNavigateToTripDetail: (String) -> Unit
 ) {
     var selectedIndex by remember { mutableIntStateOf(0) }
-    
+
     val gradientBrush = Brush.verticalGradient(
         colors = listOf(Color(0xFFE3F2FD), Color.White)
     )
@@ -137,46 +138,41 @@ fun HomeScreen(
 
 @Composable
 fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: () -> Unit) {
-    val context = LocalContext.current
-    val mainDeviceId = deviceViewModel.mainDeviceId
+    val context          = LocalContext.current
+    val mainDeviceId     = deviceViewModel.mainDeviceId
     val secondaryDevices = deviceViewModel.secondaryDevices
-    val devicesData = deviceViewModel.devicesData
-    val mainData = mainDeviceId?.let { devicesData[it] }
-    val predictionModel = remember(context) { AqiPredictionModel(context) }
-    var predictionText by remember { mutableStateOf("Waiting for sensor data") }
-    var predictionDetail by remember { mutableStateOf("") }
+    val devicesData      = deviceViewModel.devicesData
 
+    // ── Prediction model (closed when composable leaves composition) ──────────
+    val predictionModel = remember(context) { AqiPredictionModel(context) }
     DisposableEffect(predictionModel) {
         onDispose { predictionModel.close() }
     }
 
-    LaunchedEffect(mainData) {
-        predictionDetail = ""
+    // ── Auto-prediction (runs immediately, then every 30 minutes) ─────────────
+    var autoPrediction by remember { mutableStateOf<AqiPredictionResult?>(null) }
+    var autoUpdatedAt  by remember { mutableStateOf("") }
 
-        when {
-            mainData == null -> {
-                predictionText = "Waiting for sensor data"
-            }
-            !AqiPredictionModel.isModelAvailable(context) -> {
-                predictionText = "Prediction unavailable"
-                predictionDetail = "Model file missing"
-            }
-            else -> {
-                predictionText = "Calculating..."
-                val prediction = withContext(Dispatchers.Default) {
-                    runCatching { predictionModel.predict(mainData) }
+    // ── Live / on-demand prediction ───────────────────────────────────────────
+    var livePrediction by remember { mutableStateOf<AqiPredictionResult?>(null) }
+    var isRunningLive  by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // 30-minute loop: takes the MOST RECENT sensor snapshot at each tick
+    LaunchedEffect(mainDeviceId) {
+        while (true) {
+            val data = devicesData[mainDeviceId ?: ""]
+            if (data != null) {
+                val result = withContext(Dispatchers.Default) {
+                    runCatching { predictionModel.predict(data) }.getOrNull()
                 }
-
-                prediction
-                    .onSuccess { result ->
-                        predictionText = "AQI: ${result.aqi} - ${result.category}"
-                    }
-                    .onFailure { error ->
-                        Log.e("AQI_MODEL", "Prediction failed: ${error.message}", error)
-                        predictionText = "Prediction unavailable"
-                        predictionDetail = "Check model input shape"
-                    }
+                if (result != null) {
+                    autoPrediction = result
+                    autoUpdatedAt  = SimpleDateFormat("hh:mm a", Locale.getDefault())
+                        .format(Date())
+                }
             }
+            delay(30 * 60 * 1000L)
         }
     }
 
@@ -187,7 +183,6 @@ fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: ()
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // App Logo
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
             Image(
                 painter = painterResource(id = R.drawable.logo_of_app),
@@ -200,48 +195,62 @@ fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: ()
         Spacer(modifier = Modifier.height(24.dp))
 
         if (mainDeviceId == null) {
-            // No device state
             Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
+                modifier  = Modifier.fillMaxWidth(),
+                shape     = RoundedCornerShape(24.dp),
+                colors    = CardDefaults.cardColors(containerColor = Color.White),
                 elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
             ) {
                 Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(text = "No devices connected.", color = Color.Gray)
                     Spacer(modifier = Modifier.height(16.dp))
-                    Button(onClick = onNavigateToAddDevice) {
-                        Text("Connect Device")
-                    }
+                    Button(onClick = onNavigateToAddDevice) { Text("Connect Device") }
                 }
             }
         } else {
-            // 1. MAIN DEVICE UI (Indoor Monitoring)
-            IndoorDeviceSection(deviceViewModel.getMainDeviceName(), mainDeviceId, mainData)
+            IndoorDeviceSection(deviceViewModel.getMainDeviceName(), mainDeviceId, devicesData[mainDeviceId])
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 2. Prediction Card
+            // Prediction card with 30-min auto refresh + manual predict-now button
             TomorrowPredictionCard(
-                predictionText = predictionText,
-                predictionDetail = predictionDetail
+                autoPrediction = autoPrediction,
+                autoUpdatedAt  = autoUpdatedAt,
+                livePrediction = livePrediction,
+                isRunningLive  = isRunningLive,
+                onRequestLive  = {
+                    isRunningLive  = true
+                    livePrediction = null
+                    scope.launch {
+                        // Fetch the most recent reading directly from Firebase
+                        val freshData = withContext(Dispatchers.IO) {
+                            deviceViewModel.fetchLatestDeviceData(mainDeviceId)
+                        } ?: devicesData[mainDeviceId]
+
+                        val result = if (freshData != null) {
+                            withContext(Dispatchers.Default) {
+                                runCatching { predictionModel.predict(freshData) }.getOrNull()
+                            }
+                        } else null
+
+                        livePrediction = result
+                        isRunningLive  = false
+                    }
+                }
             )
-            
-            // 3. SECONDARY DEVICES SECTION
+
             if (secondaryDevices.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(32.dp))
                 Text(
-                    text = "Other Devices",
-                    fontSize = 20.sp,
+                    text       = "Other Devices",
+                    fontSize   = 20.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF0D47A1),
-                    modifier = Modifier.align(Alignment.Start)
+                    color      = Color(0xFF0D47A1),
+                    modifier   = Modifier.align(Alignment.Start)
                 )
-                
                 secondaryDevices.forEach { device ->
                     Spacer(modifier = Modifier.height(16.dp))
-                    val data = devicesData[device.id]
-                    PortableDeviceCard(device.name, data)
+                    PortableDeviceCard(device.name, devicesData[device.id])
                 }
             }
         }
@@ -252,35 +261,108 @@ fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: ()
 
 @Composable
 fun TomorrowPredictionCard(
-    predictionText: String,
-    predictionDetail: String
+    autoPrediction : AqiPredictionResult?,
+    autoUpdatedAt  : String,
+    livePrediction : AqiPredictionResult?,
+    isRunningLive  : Boolean,
+    onRequestLive  : () -> Unit
 ) {
+    // Live prediction takes priority when available
+    val display = livePrediction ?: autoPrediction
+
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
+        modifier  = Modifier.fillMaxWidth(),
+        shape     = RoundedCornerShape(24.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFE1F5FE))
+        colors    = CardDefaults.cardColors(containerColor = Color(0xFFE1F5FE))
     ) {
-        Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.Start) {
-            Text(
-                text = "Tomorrow Prediction",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF01579B)
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = predictionText,
-                fontSize = 18.sp,
-                color = Color(0xFF0277BD)
-            )
-            if (predictionDetail.isNotBlank()) {
-                Spacer(modifier = Modifier.height(4.dp))
+        Column(modifier = Modifier.padding(20.dp)) {
+
+            // Header row: title + Predict Now button
+            Row(
+                modifier              = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment     = Alignment.CenterVertically
+            ) {
                 Text(
-                    text = predictionDetail,
-                    fontSize = 12.sp,
-                    color = Color(0xFF0277BD).copy(alpha = 0.75f)
+                    text       = "Tomorrow's AQI Forecast",
+                    fontSize   = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    color      = Color(0xFF01579B)
                 )
+                OutlinedButton(
+                    onClick        = onRequestLive,
+                    enabled        = !isRunningLive,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    border         = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF0277BD))
+                ) {
+                    if (isRunningLive) {
+                        CircularProgressIndicator(
+                            modifier    = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color       = Color(0xFF0277BD)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("Predicting…", fontSize = 11.sp, color = Color(0xFF0277BD))
+                    } else {
+                        Text("Predict Now", fontSize = 11.sp, color = Color(0xFF0277BD))
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (display == null) {
+                // Still in the first 30-minute window before first auto-run
+                Text(
+                    text     = "Calculating… (auto-updates every 30 min)",
+                    fontSize = 14.sp,
+                    color    = Color(0xFF0277BD).copy(alpha = 0.7f)
+                )
+            } else {
+                // AQI number + category
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        text       = "AQI ${display.aqi}",
+                        fontSize   = 28.sp,
+                        fontWeight = FontWeight.Bold,
+                        color      = Color(0xFF0277BD)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text     = "– ${display.category}",
+                        fontSize = 15.sp,
+                        color    = Color(0xFF0277BD),
+                        modifier = Modifier.padding(bottom = 3.dp)
+                    )
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                // Accuracy chip + source label
+                Row(
+                    modifier              = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = if (display.usedFallback) Color(0xFFFFF3E0) else Color(0xFFE8F5E9)
+                    ) {
+                        Text(
+                            text     = "Accuracy ${display.accuracyPct}%",
+                            fontSize = 11.sp,
+                            color    = if (display.usedFallback) Color(0xFFE65100) else Color(0xFF2E7D32),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+
+                    if (livePrediction != null) {
+                        Text("Live result", fontSize = 11.sp, color = Color(0xFF4CAF50))
+                    } else if (autoUpdatedAt.isNotBlank()) {
+                        Text("Updated $autoUpdatedAt", fontSize = 10.sp, color = Color.Gray)
+                    }
+                }
             }
         }
     }
@@ -380,272 +462,105 @@ fun PortableDeviceCard(name: String, data: DeviceData?) {
 }
 
 @Composable
-fun CustomDeviceCard(name: String, id: String, rawData: Map<String, Any>?) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White)
-    ) {
-        Column(modifier = Modifier.padding(20.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Top) {
-                Column {
-                    Text(text = name, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.Black)
-                    Text(text = "ID: $id", fontSize = 12.sp, color = Color.Gray)
-                }
-                
-                if (rawData != null) {
-
-                    StatusTextFromRawData(
-                        rawData,
-                        Color.Black
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (rawData == null) {
-                Text(text = "Waiting for data...", color = Color.Gray, fontSize = 14.sp)
-            } else {
-                val sensorEntry = rawData.entries.firstOrNull { it.key != "timestamp" }
-                val sensorName = sensorEntry?.key?.replaceFirstChar { it.uppercase() } ?: "Sensor"
-                val sensorValue = sensorEntry?.value ?: "--"
-                
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "$sensorName: $sensorValue", 
-                        fontSize = 20.sp, 
-                        fontWeight = FontWeight.Bold, 
-                        color = Color(0xFF0D47A1)
-                    )
-                }
-                
-                Log.d("CUSTOM", "Sensor: $sensorName, Value: $sensorValue")
-            }
-        }
-    }
-}
-@Composable
 fun StatusText(
     data: DeviceData?,
     textColor: Color = Color.White
 ) {
-
     if (data == null) return
 
-    val currentKey =
-        "${data.aqi}_" +
-                "${data.pm25}_" +
-                "${data.pm10}_" +
-                "${data.co2}_" +
-                "${data.temp}_" +
-                "${data.humidity}_" +
-                "${data.lat}_" +
-                "${data.lon}_" +
-                "${data.speed_kmh}"
+    val currentKey = "${data.aqi}_${data.pm25}_${data.pm10}_${data.co2}_${data.temp}_${data.humidity}_${data.lat}_${data.lon}_${data.speed_kmh}"
 
-    var lastKey by rememberSaveable {
-        mutableStateOf("")
-    }
+    var lastKey by rememberSaveable { mutableStateOf("") }
+    var lastUpdateTime by rememberSaveable { mutableLongStateOf(0L) }
 
-    // Start as invalid
-    var lastUpdateTime by rememberSaveable {
-        mutableLongStateOf(0L)
-    }
-
-    // Detect REAL value changes only
     LaunchedEffect(currentKey) {
-
-        if (
-            currentKey != lastKey &&
-            !currentKey.contains("null")
-        ) {
-
+        if (currentKey != lastKey && !currentKey.contains("null")) {
             lastKey = currentKey
-
-            lastUpdateTime =
-                System.currentTimeMillis()
-
-            Log.d(
-                "DEVICE_STATUS",
-                "REAL DATA UPDATE"
-            )
+            lastUpdateTime = System.currentTimeMillis()
         }
     }
 
-    var currentTime by remember {
-        mutableLongStateOf(
-            System.currentTimeMillis()
-        )
-    }
+    var currentTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
     LaunchedEffect(Unit) {
         while (true) {
-
-            kotlinx.coroutines.delay(5000)
-
-            currentTime =
-                System.currentTimeMillis()
+            delay(5000)
+            currentTime = System.currentTimeMillis()
         }
     }
 
-    val (statusColor, statusText) =
-
-        // App just opened and no update yet
-        if (lastUpdateTime == 0L) {
-
-            Color.Gray to "Connecting..."
-
-        } else {
-
-            val diff =
-                currentTime -
-                        lastUpdateTime
-
-            when {
-
-                diff < 45_000 ->
-                    Color(0xFF4CAF50) to "Live"
-
-                diff < 120_000 ->
-                    Color(0xFFFFC107) to
-                            "Delayed"
-
-                else ->
-                    Color(0xFFF44336) to
-                            "Offline"
-            }
+    val (statusColor, statusText) = if (lastUpdateTime == 0L) {
+        Color.Gray to "Connecting..."
+    } else {
+        val diff = currentTime - lastUpdateTime
+        when {
+            diff < 45_000 -> Color(0xFF4CAF50) to "Live"
+            diff < 120_000 -> Color(0xFFFFC107) to "Delayed"
+            else -> Color(0xFFF44336) to "Offline"
         }
+    }
 
-    Row(
-        verticalAlignment =
-            Alignment.CenterVertically
-    ) {
-
+    Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
             modifier = Modifier
                 .size(8.dp)
-                .background(
-                    statusColor,
-                    CircleShape
-                )
+                .background(statusColor, CircleShape)
         )
-
-        Spacer(
-            modifier = Modifier.width(6.dp)
-        )
-
-        Text(
-            text = statusText,
-            color = textColor,
-            fontSize = 12.sp
-        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(text = statusText, color = textColor, fontSize = 12.sp)
     }
 }
+
 @Composable
 fun StatusTextFromRawData(
     rawData: Map<String, Any>?,
     textColor: Color = Color.Black
 ) {
-
     if (rawData == null) return
 
-    val currentKey =
-        rawData
-            .filterKeys {
-                it != "timestamp"
-            }
-            .toSortedMap()
-            .toString()
+    val currentKey = rawData.filterKeys { it != "timestamp" }.toSortedMap().toString()
 
-    var lastKey by rememberSaveable {
-        mutableStateOf("")
-    }
-
-    var lastUpdateTime by rememberSaveable {
-        mutableLongStateOf(0L)
-    }
+    var lastKey by rememberSaveable { mutableStateOf("") }
+    var lastUpdateTime by rememberSaveable { mutableLongStateOf(0L) }
 
     LaunchedEffect(currentKey) {
-
         if (currentKey != lastKey) {
-
             lastKey = currentKey
-
-            lastUpdateTime =
-                System.currentTimeMillis()
+            lastUpdateTime = System.currentTimeMillis()
         }
     }
 
-    var currentTime by remember {
-        mutableLongStateOf(
-            System.currentTimeMillis()
-        )
-    }
+    var currentTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
     LaunchedEffect(Unit) {
         while (true) {
-
-            kotlinx.coroutines.delay(5000)
-
-            currentTime =
-                System.currentTimeMillis()
+            delay(5000)
+            currentTime = System.currentTimeMillis()
         }
     }
 
-    val (statusColor, statusText) =
-
-        if (lastUpdateTime == 0L) {
-
-            Color.Gray to "Connecting..."
-
-        } else {
-
-            val diff =
-                currentTime -
-                        lastUpdateTime
-
-            when {
-
-                diff < 45_000 ->
-                    Color(0xFF4CAF50) to "Live"
-
-                diff < 120_000 ->
-                    Color(0xFFFFC107) to
-                            "Delayed"
-
-                else ->
-                    Color(0xFFF44336) to
-                            "Offline"
-            }
+    val (statusColor, statusText) = if (lastUpdateTime == 0L) {
+        Color.Gray to "Connecting..."
+    } else {
+        val diff = currentTime - lastUpdateTime
+        when {
+            diff < 45_000 -> Color(0xFF4CAF50) to "Live"
+            diff < 120_000 -> Color(0xFFFFC107) to "Delayed"
+            else -> Color(0xFFF44336) to "Offline"
         }
+    }
 
-    Row(
-        verticalAlignment =
-            Alignment.CenterVertically
-    ) {
-
+    Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
             modifier = Modifier
                 .size(8.dp)
-                .background(
-                    statusColor,
-                    CircleShape
-                )
+                .background(statusColor, CircleShape)
         )
-
-        Spacer(
-            modifier = Modifier.width(6.dp)
-        )
-
-        Text(
-            text = statusText,
-            color = textColor,
-            fontSize = 12.sp
-        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(text = statusText, color = textColor, fontSize = 12.sp)
     }
 }
+
 @Composable
 fun SensorSmallInfo(label: String, value: String, modifier: Modifier = Modifier) {
     Column(modifier = modifier) {

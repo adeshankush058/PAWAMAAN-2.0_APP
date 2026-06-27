@@ -19,7 +19,9 @@ import com.google.firebase.database.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -48,7 +50,8 @@ data class DeviceData(
     val timestamp: Long? = null,
     val lat: Double? = null,
     val lon: Double? = null,
-    val speed_kmh: Double? = null
+    val speed_kmh: Double? = null,
+    val no2: Double? = null          // NO₂ µg/m³ – optional, synthesised if absent
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +515,30 @@ class DeviceViewModel : ViewModel() {
     }
 
     fun getMainDeviceName(): String = deviceNames[mainDeviceId ?: ""] ?: "Indoor Monitoring"
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // On-demand Firebase fetch for the Predict Now button
+    //
+    // Performs a single addListenerForSingleValueEvent read of
+    // devices/<id>/latest and returns the result as a DeviceData,
+    // enriched with the mobile timestamp so it is consistent with
+    // the data the real-time listener produces.
+    // ─────────────────────────────────────────────────────────────────────────
+    suspend fun fetchLatestDeviceData(deviceId: String): DeviceData? =
+        suspendCancellableCoroutine { cont ->
+            rtdb.getReference("devices/$deviceId/latest")
+                .addListenerForSingleValueEvent(object : ValueEventListener {
+                    override fun onDataChange(snapshot: DataSnapshot) {
+                        if (!snapshot.exists()) { cont.resume(null); return }
+                        val data = snapshot.getValue(DeviceData::class.java)
+                        cont.resume(data?.copy(timestamp = System.currentTimeMillis()))
+                    }
+                    override fun onCancelled(error: DatabaseError) {
+                        Log.e("MAP", "fetchLatest cancelled: \${error.message}")
+                        cont.resume(null)
+                    }
+                })
+        }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Device management (add / delete) — unchanged
