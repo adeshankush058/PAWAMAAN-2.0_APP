@@ -23,15 +23,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.pawamaan20.R
+import com.example.pawamaan20.ml.AqiPredictionModel
 import com.example.pawamaan20.viewmodel.DeviceViewModel
 import com.example.pawamaan20.viewmodel.DeviceData
 import com.example.pawamaan20.viewmodel.DeviceItem
 import com.google.firebase.auth.FirebaseAuth
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 @Composable
@@ -133,10 +137,48 @@ fun HomeScreen(
 
 @Composable
 fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: () -> Unit) {
+    val context = LocalContext.current
     val mainDeviceId = deviceViewModel.mainDeviceId
     val secondaryDevices = deviceViewModel.secondaryDevices
     val devicesData = deviceViewModel.devicesData
     val mainData = mainDeviceId?.let { devicesData[it] }
+    val predictionModel = remember(context) { AqiPredictionModel(context) }
+    var predictionText by remember { mutableStateOf("Waiting for sensor data") }
+    var predictionDetail by remember { mutableStateOf("") }
+
+    DisposableEffect(predictionModel) {
+        onDispose { predictionModel.close() }
+    }
+
+    LaunchedEffect(mainData) {
+        predictionDetail = ""
+
+        when {
+            mainData == null -> {
+                predictionText = "Waiting for sensor data"
+            }
+            !AqiPredictionModel.isModelAvailable(context) -> {
+                predictionText = "Prediction unavailable"
+                predictionDetail = "Model file missing"
+            }
+            else -> {
+                predictionText = "Calculating..."
+                val prediction = withContext(Dispatchers.Default) {
+                    runCatching { predictionModel.predict(mainData) }
+                }
+
+                prediction
+                    .onSuccess { result ->
+                        predictionText = "AQI: ${result.aqi} - ${result.category}"
+                    }
+                    .onFailure { error ->
+                        Log.e("AQI_MODEL", "Prediction failed: ${error.message}", error)
+                        predictionText = "Prediction unavailable"
+                        predictionDetail = "Check model input shape"
+                    }
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -180,18 +222,10 @@ fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: ()
             Spacer(modifier = Modifier.height(20.dp))
 
             // 2. Prediction Card
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(24.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFE1F5FE))
-            ) {
-                Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.Start) {
-                    Text(text = "Tomorrow Prediction", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF01579B))
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(text = "AQI: 78 – Moderate", fontSize = 18.sp, color = Color(0xFF0277BD) )
-                }
-            }
+            TomorrowPredictionCard(
+                predictionText = predictionText,
+                predictionDetail = predictionDetail
+            )
             
             // 3. SECONDARY DEVICES SECTION
             if (secondaryDevices.isNotEmpty()) {
@@ -213,6 +247,42 @@ fun DashboardContent(deviceViewModel: DeviceViewModel, onNavigateToAddDevice: ()
         }
 
         Spacer(modifier = Modifier.height(100.dp))
+    }
+}
+
+@Composable
+fun TomorrowPredictionCard(
+    predictionText: String,
+    predictionDetail: String
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFE1F5FE))
+    ) {
+        Column(modifier = Modifier.padding(20.dp), horizontalAlignment = Alignment.Start) {
+            Text(
+                text = "Tomorrow Prediction",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF01579B)
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = predictionText,
+                fontSize = 18.sp,
+                color = Color(0xFF0277BD)
+            )
+            if (predictionDetail.isNotBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = predictionDetail,
+                    fontSize = 12.sp,
+                    color = Color(0xFF0277BD).copy(alpha = 0.75f)
+                )
+            }
+        }
     }
 }
 

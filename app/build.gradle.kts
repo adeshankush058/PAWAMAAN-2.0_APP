@@ -38,6 +38,9 @@ android {
     buildFeatures {
         compose = true
     }
+    androidResources {
+        noCompress += "tflite"
+    }
 }
 
 dependencies {
@@ -62,6 +65,9 @@ dependencies {
     implementation("com.google.firebase:firebase-auth-ktx")
     implementation("com.google.firebase:firebase-firestore-ktx")
     implementation("com.google.firebase:firebase-database-ktx")
+
+    // On-device ML inference for the AQI prediction model in app/src/main/assets.
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
     
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
